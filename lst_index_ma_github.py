@@ -632,6 +632,27 @@ for k in range(len(RPApolys)):
                
     with rasterio.open(vardest, "w", **out_meta) as dest:
         dest.write(st_norm_std)
+        
+    # Hotspots!
+    with rasterio.Env():
+        with rasterio.open(indexdest) as src:
+            image = src.read(1)
+            imgflt = image.flatten()
+            imgsort = np.sort(imgflt[~np.isnan(imgflt)])
+            fivepctval = imgsort[round(0.95*len(imgsort))]
+            print(name + " " + str(fivepctval))
+            hotmask = (image >= fivepctval)
+            imgsimple = hotmask.astype(int)
+            results = (
+                {'properties': {'raster_val': v}, 'geometry': s}
+                for i, (s, v)
+                in enumerate(
+                    shapes(imgsimple, mask=hotmask, transform=src.transform)))
+    geoms = list(results)
+    gpd_polygonized_raster = gpd.GeoDataFrame.from_features(geoms)
+    gpd_polygonized_raster = gpd_polygonized_raster.set_crs(RPApolys.crs)
+    shapefp = resdir + "\\hotspots_" + name + ".shp"
+    gpd_polygonized_raster.to_file(shapefp)
     
     # Clear leftover, now invalid data before moving on to next RPA
     del water
