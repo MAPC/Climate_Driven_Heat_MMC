@@ -11,6 +11,7 @@ import os
 import numpy as np
 import rasterio
 from rasterio.mask import mask
+from rasterio.mask import raster_geometry_mask
 from rasterio.merge import merge
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 import geopandas as gpd
@@ -25,7 +26,7 @@ from shapely.geometry.multipolygon import MultiPolygon
 
 # Set the minimum percent "clear" we want in a single date RPA image to use it
 # in the RPA's LST index; and minimum daily high air temperature to use a Landsat date.
-minclearp = 10  # Starting with 10% clear minimum.
+minclearp = 50  # Starting with 10% clear minimum.
 minTmax = 70    # Starting with 70 degrees Fahrenheit.
 
 # Where are all the downloaded and unzipped Landsat data stored? 
@@ -38,6 +39,8 @@ vectordir = ""
 dirtosave = ""
 # Where to save the LST index rasters when created?
 resdir = ""
+# Where to save figures when created?
+figdir = ""
 
 
 # Three custom functions we need for the analysis
@@ -437,6 +440,9 @@ for k in range(len(RPApolys)):
             stmos = (rasterio.open(stmosfp).read(1))
             stqamos = (rasterio.open(stqamosfp).read(1))
             stpixmos = (rasterio.open(stpixmosfp).read(1))
+            stmoshelp = rasterio.open(stmosfp)
+            RPAMaskproto = raster_geometry_mask(stmoshelp, shapes, invert=True)
+            RPAMask = RPAMaskproto[0]
             
             # Sad :/ but this is how I did it. "clear" bit is second from right; 1 if clear, 0 if not. 
             # ("Clear": not cloud, water, snow, cloud shadow, terrain occlusion)
@@ -451,19 +457,13 @@ for k in range(len(RPApolys)):
             # If the resulting raster is an expected size, covered by the right 
             # number of tiles, and has at least some clear areas, process further.
             if (np.sum(np.shape(stmos)) > 6 and sttilen == len(tiles)) and np.sum(clear) > 0:
-                ngood = ngood + 1
                 
                 # Translate surface temp quality assessment (Kelvin * 100) to Fahrenheit, remove fill
                     # First, calculate pct ocean. Ocean (and outside region shape)= -9998, all other original "nodata" = -9999.
                     # Turn this into an RPA mask. 
                 dims = np.shape(stqamos)
-                nonrpamask = np.ones(dims)
-                nonrpamask[stqamos == -9998] = 0
-                
-                pctempty = np.sum(stqamos < 0)/(np.shape(stqamos)[0]*np.shape(stqamos)[1])
+                pctempty = (1 - (np.sum(stqamos < 0)/(np.shape(RPAMask)[0]*np.shape(RPAMask)[1])))
                 emptyp.append(pctempty)
-                print(str(date) + ": " + str(pctempty*100) + "% empty")
-                if pctempty <= np.min(emptyp): maskrpa = nonrpamask    # Store the version with least "empty" pixels
                 
                 stqamos = stqamos.astype(float)
                 stqamos[stqamos == -9998] = np.nan
@@ -486,7 +486,6 @@ for k in range(len(RPApolys)):
                 del stqamosF
                 # Add another dimension (band 1)
                 stmosF = np.expand_dims(stmosF, axis=0)
-                if ngood == 1: stmosF_norm = np.empty(np.shape(stmosF) + (1,))
                 
                 if np.sum(~np.isnan(stmosF.flatten())) > 0:
                     
@@ -504,17 +503,21 @@ for k in range(len(RPApolys)):
                         dest.write(stmosF)
                         
                     # # Calculate percent of mosaiced tiles that are clear, + stats of remaining cell values.
-                    pclear = (np.sum(~np.isnan(stmosF[0,maskrpa.astype(bool)]))/np.product(np.shape(stmosF)))*100
-                    
+                    pclear = (np.sum(~np.isnan(stmosF))/np.sum(RPAMask))*100
+                    print(str(pclear) + "% clear")
+
                     gc.collect()
                     
                     # Create maxmin normed array: [1, nhpixels, nvpixels, ndays]
                     if (pclear > minclearp) & (np.max(stmosF_norm) < 0.01): 
-                        print("Haven't yet filled out normed one-date image (this is the first good date)")
-                        stmosF_norm = np.empty(np.shape(stmosF) + (1,))
+                        ngood = ngood + 1
                         stnorm = maxminnorm(stmosF)
-                        
-                        stmosF_norm[:,:,:,0] = stnorm
+                        if ngood == 1: 
+                            stmosF_norm = np.empty(np.shape(stmosF) + (1,))
+                            stmosF_norm[:,:,:,0] = stnorm
+                            print("Haven't yet filled out normed one-date image (this is the first good date)")
+                        else:
+                            stmosF_norm = np.append(stmosF_norm, np.expand_dims(stnorm, axis=3), axis = 3)
                         
                         # Save the file path for later
                         fps.append(out_fp)
@@ -538,8 +541,15 @@ for k in range(len(RPApolys)):
                         
                         tilenst.append(sttilen) 
                     elif pclear > minclearp:
+                        ngood = ngood + 1
                         stnorm = maxminnorm(stmosF)
-                        stmosF_norm = np.append(stmosF_norm, np.expand_dims(stnorm, axis=3), axis = 3)
+                        if ngood == 1: 
+                            stmosF_norm = np.empty(np.shape(stmosF) + (1,))
+                            stmosF_norm[:,:,:,0] = stnorm
+                            print("Haven't yet filled out normed one-date image (this is the first good date)")
+                        else:
+                            stmosF_norm = np.append(stmosF_norm, np.expand_dims(stnorm, axis=3), axis = 3)
+                            
                         # Save the file path for later
                         fps.append(out_fp)
                         
@@ -562,7 +572,7 @@ for k in range(len(RPApolys)):
                         
                         tilenst.append(sttilen) 
                     else:
-                        pass
+                        print("Less than 50% clear")
                     del stmosF
                 else:
                     print('Skipping ' + str(date) + ' because 0% clear')
@@ -595,21 +605,20 @@ for k in range(len(RPApolys)):
     datedf.to_csv(metaloc)
     
     ''' At last: Create the LST index from the max-min normed single-day surface temperature images.'''
-    # First, make sure we use the correct water mask.
-    date = datesfull[0]
-    (stpixmosfp, stpixinf, stpixtilen, pixmeta) = mosaicdate(archives, str(date), '_PIXELQA', shapes, RPAname, tiles, shapecrs, dirtosave)
-    stpixmos = (rasterio.open(stpixmosfp).read(1))
-    stpixmos[stpixmos > 2047] = 1   # Set quality band to "fill" if invalid
-    water = np.logical_and((((((((((stpixmos % 1024) % 512) % 256) % 128) % 64) % 32) % 16) % 8) % 4) < ((((((((stpixmos % 1024) % 512) % 256) % 128) % 64) % 32) % 16) % 8), stpixmos > 1)
-    
-    maskrpa = np.array(maskrpa, dtype = bool)
     st_norm_mn = np.nanmean(stmosF_norm, axis=3)
     st_norm_mn = fill(st_norm_mn)   # Fill in missing data with nearest values
-    st_norm_mn[:,~maskrpa] = np.nan # Then make sure the parts outside the RPA are nodata
-    #st_norm_mn[:,water] = np.nan
+    st_norm_mn[:,~RPAMask] = np.nan # Then make sure the parts outside the RPA are nodata
     st_norm_std = np.nanstd(stmosF_norm, axis=3)
-    st_norm_std[:, ~maskrpa] = np.nan
-    #st_norm_std[:,water] = np.nan
+    st_norm_std[:, ~RPAMask] = np.nan
+
+    fig, ax = plt.subplots(figsize=(10,10))
+    lstplot = ax.imshow(np.squeeze(st_norm_mn), cmap = 'gist_rainbow', vmin=0, vmax = 1)
+    ax.set_title("LST index: " + RPAname, fontsize=14)
+    cbar = fig.colorbar(lstplot, fraction=0.035, pad=0.01)
+    cbar.ax.get_yaxis().labelpad = 15
+    cbar.ax.set_ylabel("Normalized ST", rotation=270)
+    ax.set_axis_off()
+    plt.show()
     
     indexdest = resdir + "\\LST_index_normwater_" + RPAname + ".tif"
     # Copy metadata from last raster processed
@@ -701,4 +710,38 @@ cbar.ax.set_ylabel("Normalized ST", rotation=270)
 ax.set_axis_off()
 plt.show()
     
+# Lastly- create figures displaying histograms of standard deviation, LST index in each RPA.
+
+for k in range(len(RPApolys)):
+    RPAname = RPApolys['RPAshrt'].values[k]
+    RPAlong = RPApolys['RPA'].values[k]
+    
+    indexfp = resdir + "\\LST_index_normwater_" + RPAname + ".tif"
+    RPAindex = rasterio.open(indexfp).read(1)
+    RPAindexflat = RPAindex[~np.isnan(RPAindex)].flatten()
+    
+    vardest = resdir + "\\LST_std_normwater_" + RPAname + ".tif"
+    RPAvar = rasterio.open(vardest).read(1)
+    RPAvarflat = RPAvar[~np.isnan(RPAvar)].flatten()
+    
+        # Show distribution of index values
+    fname = figdir + "\\lstind_subplots_" + RPAname + ".png"
+    fig, (ax1,ax2) = plt.subplots(2,1, figsize=(10,10))
+    lstplot1 = ax1.hist(RPAindexflat, bins=50)
+    ax1.set_title(RPAlong + " Pixel-wise Mean of Single Day LST Index Values", fontsize=14)
+    ax1.set_ylabel("Pixel Count")
+    ax1.set_xlabel("Index Value")
+    ax1.set_xlim([0,1])
+    
+    
+    lstplot2 = ax2.hist(RPAvarflat, bins=50)
+    ax2.set_title(RPAlong + " Pixel-wise Standard Deviation of Single Day LST Index Values", fontsize=14)
+    ax2.set_ylabel("Pixel Count")
+    ax2.set_xlabel("Index Standard Deviation")
+    ax2.set_xlim([0,1])
+    plt.savefig(fname, dpi=None, facecolor='w', edgecolor='w',
+                orientation='landscape', format=None,
+                transparent=True, bbox_inches='tight', pad_inches=0.1,
+                metadata=None)
+    plt.show()
 
